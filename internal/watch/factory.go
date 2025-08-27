@@ -155,7 +155,16 @@ func (f *Factory) waitForCacheSync(ns string) {
 		<-time.After(defaultWaitTime)
 		close(c)
 	}(c)
+	
+	cacheStart := time.Now()
 	_ = fac.WaitForCacheSync(c)
+	cacheDuration := time.Since(cacheStart)
+	
+	slog.Debug("[PERF] waitForCacheSync",
+		"ns", ns,
+		"duration", cacheDuration,
+		"waitTime", defaultWaitTime,
+	)
 }
 
 // WaitForCacheSync waits for all factories to update their cache.
@@ -229,6 +238,7 @@ func (f *Factory) ForResource(ns string, gvr *client.GVR) (informers.GenericInfo
 
 	f.mx.RLock()
 	defer f.mx.RUnlock()
+	
 	fact.Start(f.stopChan)
 
 	return inf, nil

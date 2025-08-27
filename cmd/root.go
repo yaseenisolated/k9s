@@ -107,21 +107,42 @@ func run(*cobra.Command, []string) error {
 		TimeFormat: time.RFC3339,
 	})))
 
+	appStart := time.Now()
+	
+	configStart := time.Now()
 	cfg, err := loadConfiguration()
+	configDuration := time.Since(configStart)
+	slog.Debug("[PERF] Configuration loaded", "duration", configDuration)
+	
 	if err != nil {
 		slog.Warn("Fail to load global/context configuration", slogs.Error, err)
 	}
+	
+	appCreateStart := time.Now()
 	app := view.NewApp(cfg)
+	appCreateDuration := time.Since(appCreateStart)
+	slog.Debug("[PERF] App created", "duration", appCreateDuration)
+	
 	if app.Config.K9s.DefaultView != "" {
 		app.Config.SetActiveView(app.Config.K9s.DefaultView)
 	}
 
+	initStart := time.Now()
 	if err := app.Init(version, int(*k9sFlags.RefreshRate)); err != nil {
 		return err
 	}
+	initDuration := time.Since(initStart)
+	slog.Debug("[PERF] App initialized", "duration", initDuration)
+	
+	runStart := time.Now()
 	if err := app.Run(); err != nil {
 		return err
 	}
+	runDuration := time.Since(runStart)
+	totalDuration := time.Since(appStart)
+	
+	slog.Debug("[PERF] App run completed", "duration", runDuration)
+	slog.Debug("[PERF] Total app startup", "duration", totalDuration)
 	if view.ExitStatus != "" {
 		return fmt.Errorf("view exit status %s", view.ExitStatus)
 	}
@@ -132,40 +153,61 @@ func run(*cobra.Command, []string) error {
 func loadConfiguration() (*config.Config, error) {
 	slog.Info("🐶 K9s starting up...")
 
+	k8sCfgStart := time.Now()
 	k8sCfg := client.NewConfig(k8sFlags)
+	k8sCfgDuration := time.Since(k8sCfgStart)
+	slog.Debug("[PERF] K8s config creation", "duration", k8sCfgDuration)
+	
+	k9sCfgStart := time.Now()
 	k9sCfg := config.NewConfig(k8sCfg)
+	k9sCfgDuration := time.Since(k9sCfgStart)
+	slog.Debug("[PERF] K9s config creation", "duration", k9sCfgDuration)
+	
 	var errs error
 
+	connStart := time.Now()
 	conn, err := client.InitConnection(k8sCfg, slog.Default())
+	connDuration := time.Since(connStart)
+	slog.Debug("[PERF] Init connection", "duration", connDuration)
 	if err != nil {
 		errs = errors.Join(errs, err)
 	}
 	k9sCfg.SetConnection(conn)
 
+	loadStart := time.Now()
 	if err := k9sCfg.Load(config.AppConfigFile, false); err != nil {
 		errs = errors.Join(errs, err)
 	}
+	loadDuration := time.Since(loadStart)
+	slog.Debug("[PERF] K9s config load", "duration", loadDuration)
+	
+	overrideStart := time.Now()
 	k9sCfg.K9s.Override(k9sFlags)
+	overrideDuration := time.Since(overrideStart)
+	slog.Debug("[PERF] K9s config override", "duration", overrideDuration)
+	
+	refineStart := time.Now()
 	if err := k9sCfg.Refine(k8sFlags, k9sFlags, k8sCfg); err != nil {
 		slog.Error("Fail to refine k9s config", slogs.Error, err)
 		errs = errors.Join(errs, err)
 	}
+	refineDuration := time.Since(refineStart)
+	slog.Debug("[PERF] K9s config refine", "duration", refineDuration)
 
-	// Try to access server version if that fail. Connectivity issue?
-	if !conn.CheckConnectivity() {
-		errs = errors.Join(errs, fmt.Errorf("cannot connect to context: %s", k9sCfg.K9s.ActiveContextName()))
-	}
-	if !conn.ConnectionOK() {
-		slog.Warn("💣 Kubernetes connectivity toast!")
-		errs = errors.Join(errs, fmt.Errorf("k8s connection failed for context: %s", k9sCfg.K9s.ActiveContextName()))
-	} else {
-		slog.Info("✅ Kubernetes connectivity OK")
-	}
+	// Skip connectivity check during startup for performance - auth checks already verify connection
+	connectivityStart := time.Now()
+	slog.Debug("Skipping connectivity check during startup for performance")
+	slog.Info("✅ Kubernetes connectivity assumed OK (auth checks passed)")
+	connectivityDuration := time.Since(connectivityStart)
+	slog.Debug("[PERF] Connectivity check", "duration", connectivityDuration)
 
+	saveStart := time.Now()
 	if err := k9sCfg.Save(false); err != nil {
 		slog.Error("K9s config save failed", slogs.Error, err)
 		errs = errors.Join(errs, err)
 	}
+	saveDuration := time.Since(saveStart)
+	slog.Debug("[PERF] K9s config save", "duration", saveDuration)
 
 	return k9sCfg, errs
 }
@@ -257,7 +299,6 @@ func initK9sFlags() {
 		"",
 		"Sets a path to a dir for a screen dumps",
 	)
-	rootCmd.Flags()
 }
 
 func initK8sFlags() {

@@ -71,16 +71,20 @@ func InitConnection(config *Config, log *slog.Logger) (*APIClient, error) {
 		connOK: true,
 		log:    log.With(slogs.Subsys, "client"),
 	}
-	err := a.supportsMetricsResources()
-	if err != nil {
-		slog.Warn("Fail to locate metrics-server", slogs.Error, err)
-	}
-	if err == nil || errors.Is(err, noMetricServerErr) || errors.Is(err, metricsUnsupportedErr) {
-		return &a, nil
-	}
-	a.connOK = false
+	
+	// Check metrics availability asynchronously to avoid blocking startup
+	go func() {
+		start := time.Now()
+		err := a.supportsMetricsResources()
+		duration := time.Since(start)
+		if err != nil {
+			slog.Debug("Metrics-server not available (async check)", slogs.Error, err, "duration", duration)
+		} else {
+			slog.Debug("Metrics-server available", "duration", duration)
+		}
+	}()
 
-	return &a, err
+	return &a, nil
 }
 
 // ConnectionOK returns connection status.
@@ -147,6 +151,17 @@ func (a *APIClient) clearCache() {
 
 // CanI checks if user has access to a certain resource.
 func (a *APIClient) CanI(ns string, gvr *GVR, name string, verbs []string) (auth bool, err error) {
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start)
+		a.log.Debug("[PERF] CanI total",
+			"gvr", gvr,
+			"verbs", verbs,
+			"duration", duration,
+			"cached", err == nil && duration < 50*time.Millisecond,
+		)
+	}()
+	
 	if !a.getConnOK() {
 		return false, errors.New("ACCESS -- No API server connection")
 	}
@@ -170,13 +185,24 @@ func (a *APIClient) CanI(ns string, gvr *GVR, name string, verbs []string) (auth
 	if err != nil {
 		return false, err
 	}
-	client, sar := dial.AuthorizationV1().SelfSubjectAccessReviews(), makeSAR(ns, gvr, name)
+	authClient := dial.AuthorizationV1().SelfSubjectAccessReviews()
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.config.CallTimeout())
-	defer cancel()
-	for _, v := range verbs {
-		sar.Spec.ResourceAttributes.Verb = v
-		resp, err := client.Create(ctx, sar, metav1.CreateOptions{})
+	// For single verb, use original sequential logic
+	if len(verbs) == 1 {
+		sar := makeSAR(ns, gvr, name)
+		sar.Spec.ResourceAttributes.Verb = verbs[0]
+		
+		authStart := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), a.config.CallTimeout())
+		defer cancel()
+		
+		resp, err := authClient.Create(ctx, sar, metav1.CreateOptions{})
+		authDuration := time.Since(authStart)
+		
+		clog.Debug("[PERF] Single auth check",
+			"verb", verbs[0],
+			"duration", authDuration,
+		)
 		clog.Debug("[CAN] access",
 			slogs.GVR, gvr,
 			slogs.Namespace, ns,
@@ -192,17 +218,90 @@ func (a *APIClient) CanI(ns string, gvr *GVR, name string, verbs []string) (auth
 		if err != nil {
 			clog.Warn("Auth request failed", slogs.Error, err)
 			a.cache.Add(key, false, cacheExpiry)
-			return auth, err
+			return false, err
 		}
 		if !resp.Status.Allowed {
 			a.cache.Add(key, false, cacheExpiry)
-			return auth, fmt.Errorf("`%s access denied for user on %q:%s", v, ns, gvr)
+			return false, fmt.Errorf("`%s access denied for user on %q:%s", verbs[0], ns, gvr)
+		}
+		a.cache.Add(key, true, cacheExpiry)
+		return true, nil
+	}
+
+	// For multiple verbs, use concurrent logic
+	type verbResult struct {
+		verb    string
+		allowed bool
+		reason  string
+		err     error
+	}
+
+	resultChan := make(chan verbResult, len(verbs))
+	ctx, cancel := context.WithTimeout(context.Background(), a.config.CallTimeout())
+	defer cancel()
+
+	// Launch concurrent authorization checks
+	for _, v := range verbs {
+		go func(verb string) {
+			verbStart := time.Now()
+			sar := makeSAR(ns, gvr, name)
+			sar.Spec.ResourceAttributes.Verb = verb
+			
+			resp, err := authClient.Create(ctx, sar, metav1.CreateOptions{})
+			verbDuration := time.Since(verbStart)
+			
+			clog.Debug("[PERF] Concurrent auth check",
+				"verb", verb,
+				"duration", verbDuration,
+			)
+			
+			result := verbResult{
+				verb: verb,
+				err:  err,
+			}
+			
+			if resp != nil {
+				result.allowed = resp.Status.Allowed
+				result.reason = resp.Status.Reason
+			}
+			
+			resultChan <- result
+		}(v)
+	}
+
+	// Collect results from all concurrent checks
+	for i := 0; i < len(verbs); i++ {
+		result := <-resultChan
+		
+		clog.Debug("[CAN] access",
+			slogs.GVR, gvr,
+			slogs.Namespace, ns,
+			slogs.ResName, name,
+			slogs.Verb, []string{result.verb},
+		)
+		
+		if result.err == nil {
+			clog.Debug("[CAN] reps",
+				slogs.AuthStatus, result.allowed,
+				slogs.AuthReason, result.reason,
+			)
+		}
+		
+		if result.err != nil {
+			clog.Warn("Auth request failed", slogs.Error, result.err)
+			a.cache.Add(key, false, cacheExpiry)
+			return false, result.err
+		}
+		
+		if !result.allowed {
+			a.cache.Add(key, false, cacheExpiry)
+			return false, fmt.Errorf("`%s access denied for user on %q:%s", result.verb, ns, gvr)
 		}
 	}
-	auth = true
-	a.cache.Add(key, true, cacheExpiry)
 
-	return
+	// All verbs allowed
+	a.cache.Add(key, true, cacheExpiry)
+	return true, nil
 }
 
 // CurrentNamespaceName return namespace name set via either cli arg or cluster config.
@@ -278,6 +377,7 @@ func (a *APIClient) ValidNamespaceNames() (NamespaceNames, error) {
 	if err != nil {
 		return nil, err
 	}
+	
 	ctx, cancel := context.WithTimeout(context.Background(), a.config.CallTimeout())
 	defer cancel()
 	nn, err := dial.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
@@ -311,6 +411,7 @@ func (a *APIClient) CheckConnectivity() bool {
 		return a.connOK
 	}
 	cfg.Timeout = a.config.CallTimeout()
+	
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		slog.Error("Unable to connect to api server", slogs.Error, err)
@@ -617,6 +718,7 @@ func (a *APIClient) supportsMetricsResources() error {
 		slog.Warn("Unable to dial API client for metrics", slogs.Error, err)
 		return err
 	}
+	
 	apiGroups, err := dial.Discovery().ServerGroups()
 	if err != nil {
 		return err

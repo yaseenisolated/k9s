@@ -227,31 +227,68 @@ func (t *Table) updater(ctx context.Context) {
 }
 
 func (t *Table) refresh(ctx context.Context) error {
+	start := time.Now()
+	defer func() {
+		slog.Debug("[PERF] Table refresh total",
+			"gvr", t.gvr,
+			"duration", time.Since(start),
+		)
+	}()
+	
 	if !atomic.CompareAndSwapInt32(&t.inUpdate, 0, 1) {
 		slog.Debug("Dropping update...")
 		return nil
 	}
 	defer atomic.StoreInt32(&t.inUpdate, 0)
 
+	reconcileStart := time.Now()
 	if err := t.reconcile(ctx); err != nil {
 		return err
 	}
+	reconcileDuration := time.Since(reconcileStart)
+	slog.Debug("[PERF] Table reconcile",
+		"gvr", t.gvr,
+		"duration", reconcileDuration,
+	)
+	
+	fireStart := time.Now()
 	data := t.Peek()
 	if data.RowCount() == 0 {
 		t.fireNoData(data)
 	} else {
 		t.fireTableChanged(data)
 	}
+	fireDuration := time.Since(fireStart)
+	slog.Debug("[PERF] Table fire events",
+		"gvr", t.gvr,
+		"rowCount", data.RowCount(),
+		"duration", fireDuration,
+	)
 
 	return nil
 }
 
 func (t *Table) list(ctx context.Context, a dao.Accessor) ([]runtime.Object, error) {
+	start := time.Now()
+	defer func() {
+		slog.Debug("[PERF] Table list total",
+			"gvr", t.gvr,
+			"duration", time.Since(start),
+		)
+	}()
+	
 	factory, ok := ctx.Value(internal.KeyFactory).(dao.Factory)
 	if !ok {
 		return nil, fmt.Errorf("expected Factory in context but got %T", ctx.Value(internal.KeyFactory))
 	}
+	
+	initStart := time.Now()
 	a.Init(factory, t.gvr)
+	initDuration := time.Since(initStart)
+	slog.Debug("[PERF] Table list init",
+		"gvr", t.gvr,
+		"duration", initDuration,
+	)
 
 	t.mx.RLock()
 	ctx = context.WithValue(ctx, internal.KeyLabels, t.labelSelector)
@@ -262,7 +299,17 @@ func (t *Table) list(ctx context.Context, a dao.Accessor) ([]runtime.Object, err
 		ns = client.BlankNamespace
 	}
 
-	return a.List(ctx, ns)
+	apiStart := time.Now()
+	result, err := a.List(ctx, ns)
+	apiDuration := time.Since(apiStart)
+	slog.Debug("[PERF] Table list API call",
+		"gvr", t.gvr,
+		"ns", ns,
+		"objectCount", len(result),
+		"duration", apiDuration,
+	)
+	
+	return result, err
 }
 
 func (t *Table) reconcile(ctx context.Context) error {
@@ -287,7 +334,16 @@ func (t *Table) reconcile(ctx context.Context) error {
 	r := meta.Renderer
 	r.SetViewSetting(t.vs)
 
-	return t.data.Render(ctx, meta.Renderer, oo)
+	renderStart := time.Now()
+	err = t.data.Render(ctx, meta.Renderer, oo)
+	renderDuration := time.Since(renderStart)
+	slog.Debug("[PERF] Table data render",
+		"gvr", t.gvr,
+		"objectCount", len(oo),
+		"duration", renderDuration,
+	)
+	
+	return err
 }
 
 func (t *Table) fireTableChanged(data *model1.TableData) {

@@ -169,18 +169,34 @@ func (b *Browser) Start() {
 		slog.Error("Unable to switch namespace", slogs.Error, err)
 	}
 
+	start := time.Now()
+	slog.Debug("[PERF] Browser starting", "gvr", b.GVR())
+	
 	b.Stop()
 	b.firstView.Store(0) // Reset first view counter on each start
+	
+	setupStart := time.Now()
 	b.GetModel().AddListener(b)
 	b.Table.Start()
 	b.CmdBuff().AddListener(b)
+	setupDuration := time.Since(setupStart)
+	slog.Debug("[PERF] Browser setup", "gvr", b.GVR(), "duration", setupDuration)
+	
+	watchStart := time.Now()
 	if err := b.GetModel().Watch(b.prepareContext()); err != nil {
+		watchDuration := time.Since(watchStart)
+		totalDuration := time.Since(start)
+		slog.Debug("[PERF] Browser watch failed", "gvr", b.GVR(), "watchDuration", watchDuration, "totalDuration", totalDuration)
 		go func() {
 			time.Sleep(500 * time.Millisecond)
 			b.app.QueueUpdateDraw(func() {
 				b.App().Flash().Errf("Watcher failed for %s -- %s", b.GVR(), err)
 			})
 		}()
+	} else {
+		watchDuration := time.Since(watchStart)
+		totalDuration := time.Since(start)
+		slog.Debug("[PERF] Browser watch success", "gvr", b.GVR(), "watchDuration", watchDuration, "totalDuration", totalDuration)
 	}
 }
 
