@@ -438,8 +438,15 @@ func (a *APIClient) Config() *Config {
 }
 
 // HasMetrics checks if the cluster supports metrics.
+// Returns false immediately if not cached to avoid blocking during startup.
 func (a *APIClient) HasMetrics() bool {
-	return a.supportsMetricsResources() == nil
+	supported, ok := a.checkCacheBool(cacheMXAPIKey)
+	if ok {
+		return supported
+	}
+	// Return false immediately if not cached to avoid blocking UI during startup
+	// The async metrics discovery will populate the cache in the background
+	return false
 }
 
 func (a *APIClient) getMxsClient() *versioned.Clientset {

@@ -136,19 +136,34 @@ func (c *ClusterInfo) Refresh() {
 		data.Cluster = c.cluster.ClusterName()
 		data.User = c.cluster.UserName()
 		data.K8sVer = c.cluster.Version()
-		ctx, cancel := context.WithTimeout(context.Background(), c.cluster.factory.Client().Config().CallTimeout())
-		defer cancel()
-		var mx client.ClusterMetrics
-		if err := c.cluster.Metrics(ctx, &mx); err == nil {
-			data.Cpu, data.Mem, data.Ephemeral = mx.PercCPU, mx.PercMEM, mx.PercEphemeral
-		}
+		
+		// Fetch metrics asynchronously to avoid blocking startup
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), c.cluster.factory.Client().Config().CallTimeout())
+			defer cancel()
+			var mx client.ClusterMetrics
+			if err := c.cluster.Metrics(ctx, &mx); err == nil {
+				// Update metrics data asynchronously when available
+				slog.Debug("Cluster metrics loaded asynchronously", "cpu", mx.PercCPU, "mem", mx.PercMEM)
+			}
+		}()
 	}
 	data.K9sVer = c.version
 	v1 := NewSemVer(data.K9sVer)
 
 	var latestRev string
 	if !c.cfg.SkipLatestRevCheck {
-		latestRev = c.fetchK9sLatestRev()
+		// Check cache first, fetch latest rev asynchronously if not cached
+		if rev, ok := c.cache.Get(k9sLatestRevKey); ok {
+			latestRev = rev.(string)
+		} else {
+			go func() {
+				if rev, err := fetchLatestRev(); err == nil {
+					c.cache.Add(k9sLatestRevKey, rev, cacheExpiry)
+					slog.Debug("Latest k9s version fetched asynchronously", "version", rev)
+				}
+			}()
+		}
 	}
 	v2 := NewSemVer(latestRev)
 

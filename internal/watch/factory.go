@@ -4,6 +4,7 @@
 package watch
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/slogs"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -22,24 +24,28 @@ import (
 
 const (
 	defaultResync   = 10 * time.Minute
-	defaultWaitTime = 500 * time.Millisecond
+	defaultWaitTime = 100 * time.Millisecond
 )
 
 // Factory tracks various resource informers.
 type Factory struct {
-	factories  map[string]di.DynamicSharedInformerFactory
-	client     client.Connection
-	stopChan   chan struct{}
-	forwarders Forwarders
-	mx         sync.RWMutex
+	factories      map[string]di.DynamicSharedInformerFactory
+	client         client.Connection
+	stopChan       chan struct{}
+	forwarders     Forwarders
+	firstPageCache map[string][]runtime.Object  // Track first page data for fast loading
+	fastLoadDone   map[string]bool              // Track which GVRs have been fast-loaded
+	mx             sync.RWMutex
 }
 
 // NewFactory returns a new informers factory.
 func NewFactory(clt client.Connection) *Factory {
 	return &Factory{
-		client:     clt,
-		factories:  make(map[string]di.DynamicSharedInformerFactory),
-		forwarders: NewForwarders(),
+		client:         clt,
+		factories:      make(map[string]di.DynamicSharedInformerFactory),
+		forwarders:     NewForwarders(),
+		firstPageCache: make(map[string][]runtime.Object),
+		fastLoadDone:   make(map[string]bool),
 	}
 }
 
@@ -76,6 +82,39 @@ func (f *Factory) List(gvr *client.GVR, ns string, wait bool, lbls labels.Select
 	if client.IsAllNamespace(ns) {
 		ns = client.BlankNamespace
 	}
+	
+	// Smart fast loading: check if this is first access to this GVR
+	gvrKey := gvr.String() + ":" + ns
+	f.mx.RLock()
+	needsFastLoad := !f.fastLoadDone[gvrKey]
+	cachedData := f.firstPageCache[gvrKey]
+	f.mx.RUnlock()
+	
+	// If first access and no cached data, do fast paginated load
+	if needsFastLoad && cachedData == nil {
+		if fastData, err := f.fastLoadFirstPage(gvr, ns, lbls); err == nil {
+			f.mx.Lock()
+			f.firstPageCache[gvrKey] = fastData
+			f.fastLoadDone[gvrKey] = true
+			f.mx.Unlock()
+			
+			slog.Debug("[PERF] Fast first page loaded", "gvr", gvr, "ns", ns, "count", len(fastData))
+			
+			// Start background informer for full data + live updates
+			go f.startBackgroundInformer(gvr, ns)
+			
+			return fastData, nil
+		}
+		// If fast load failed, fall back to normal flow
+		slog.Debug("Fast load failed, falling back to normal informer", "gvr", gvr)
+	}
+	
+	// Return cached fast data if available
+	if cachedData != nil {
+		return cachedData, nil
+	}
+	
+	// Normal informer flow (existing logic)
 	inf, err := f.CanForResource(ns, gvr, client.ListAccess)
 	if err != nil {
 		return nil, err
@@ -331,4 +370,115 @@ func (f *Factory) ValidatePortForwards() {
 			delete(f.forwarders, k)
 		}
 	}
+}
+
+// fastLoadFirstPage does a direct paginated API call to get the first page quickly
+func (f *Factory) fastLoadFirstPage(gvr *client.GVR, ns string, lbls labels.Selector) ([]runtime.Object, error) {
+	start := time.Now()
+	
+	// Get direct API client
+	dial, err := f.client.DynDial()
+	if err != nil {
+		return nil, err
+	}
+	
+	resourceClient := dial.Resource(gvr.GVR())
+	
+	// Setup paginated list options
+	opts := metav1.ListOptions{
+		LabelSelector: lbls.String(),
+		Limit:         75,  // First page size - good balance between speed and usefulness
+	}
+	
+	// Direct paginated API call
+	var ll *unstructured.UnstructuredList
+	if client.IsClusterScoped(ns) {
+		ll, err = resourceClient.List(context.Background(), opts)
+	} else {
+		ll, err = resourceClient.Namespace(ns).List(context.Background(), opts)
+	}
+	if err != nil {
+		return nil, err
+	}
+	
+	// Convert to runtime objects
+	oo := make([]runtime.Object, len(ll.Items))
+	for i := range ll.Items {
+		oo[i] = &ll.Items[i]
+	}
+	
+	duration := time.Since(start)
+	hasMore := ll.GetContinue() != ""
+	slog.Info("✅ Fast first page loaded", 
+		"gvr", gvr, 
+		"ns", ns, 
+		"count", len(oo), 
+		"hasMore", hasMore,
+		"duration", duration,
+	)
+	
+	return oo, nil
+}
+
+// startBackgroundInformer starts the normal informer in the background for full data + live updates
+func (f *Factory) startBackgroundInformer(gvr *client.GVR, ns string) {
+	slog.Debug("[PERF] Starting background informer", "gvr", gvr, "ns", ns)
+	
+	start := time.Now()
+	
+	// This will initialize the full informer cache in the background
+	if _, err := f.CanForResource(ns, gvr, client.ListAccess); err != nil {
+		slog.Error("Background informer setup failed", "gvr", gvr, "error", err)
+		return
+	}
+	
+	// Wait for the informer to be fully synced, then switch to live data
+	go func() {
+		// Wait for informer to be ready with proper synchronization
+		inf, err := f.CanForResource(ns, gvr, client.ListAccess)
+		if err != nil {
+			slog.Error("Failed to get informer for sync check", "gvr", gvr, "error", err)
+			return
+		}
+		
+		// Use proper informer synchronization instead of arbitrary sleep
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		
+		// Create a channel that closes when the informer is synced
+		syncChan := make(chan struct{})
+		go func() {
+			defer close(syncChan)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(50 * time.Millisecond):
+					if inf.Informer().HasSynced() {
+						return
+					}
+				}
+			}
+		}()
+		
+		// Wait for sync or timeout
+		select {
+		case <-syncChan:
+			slog.Debug("[PERF] Background informer synced successfully", "gvr", gvr)
+		case <-ctx.Done():
+			slog.Warn("[PERF] Background informer sync timeout", "gvr", gvr, "timeout", "10s")
+		}
+		
+		// Clear the fast-loaded cache to switch to live informer data
+		gvrKey := gvr.String() + ":" + ns
+		f.mx.Lock()
+		delete(f.firstPageCache, gvrKey)
+		f.mx.Unlock()
+		
+		duration := time.Since(start)
+		slog.Debug("[PERF] Background informer ready, switched to live data", 
+			"gvr", gvr, 
+			"duration", duration,
+		)
+	}()
 }
