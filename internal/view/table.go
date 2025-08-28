@@ -50,6 +50,7 @@ func (t *Table) Init(ctx context.Context) (err error) {
 	}
 	ctx = context.WithValue(ctx, internal.KeyStyles, t.app.Styles)
 	ctx = context.WithValue(ctx, internal.KeyViewConfig, t.app.CustomView())
+	ctx = context.WithValue(ctx, internal.KeyFactory, t.app.factory)
 	t.Table.Init(ctx)
 	if !t.app.Config.K9s.UI.Reactive {
 		if err := t.app.RefreshCustomViews(); err != nil {

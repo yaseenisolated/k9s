@@ -12,11 +12,13 @@ import (
 	"github.com/derailed/k9s/internal"
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/config"
+	"github.com/derailed/k9s/internal/dao"
 	"github.com/derailed/k9s/internal/model"
 	"github.com/derailed/k9s/internal/model1"
 	"github.com/derailed/k9s/internal/render"
 	"github.com/derailed/k9s/internal/slogs"
 	"github.com/derailed/k9s/internal/vul"
+	"github.com/derailed/k9s/internal/watch"
 	"github.com/derailed/tcell/v2"
 	"github.com/derailed/tview"
 )
@@ -530,6 +532,12 @@ func (t *Table) styleTitle() string {
 	if client.IsClusterWide(ns) || ns == client.NotNamespaced {
 		ns = client.NamespaceAll
 	}
+	
+	// For loading check, use the normalized namespace that factory expects
+	factoryNS := ns
+	if client.IsAllNamespace(ns) {
+		factoryNS = client.BlankNamespace
+	}
 	path := t.Path
 	if path != "" {
 		cns, n := client.Namespaced(path)
@@ -548,14 +556,30 @@ func (t *Table) styleTitle() string {
 		resource = t.gvr.String()
 	}
 
+	// Check if background loading is in progress
+	var countStr string
+	if factory, ok := t.ctx.Value(internal.KeyFactory).(dao.Factory); ok {
+		if wf, ok2 := factory.(*watch.Factory); ok2 {
+			if wf.IsBackgroundLoading(t.gvr, factoryNS) {
+				countStr = "loading..."
+			} else {
+				countStr = render.AsThousands(rc)
+			}
+		} else {
+			countStr = render.AsThousands(rc)
+		}
+	} else {
+		countStr = render.AsThousands(rc)
+	}
+
 	var (
 		title  string
 		styles = t.styles.Frame()
 	)
 	if ns == client.ClusterScope {
-		title = SkinTitle(fmt.Sprintf(TitleFmt, resource, render.AsThousands(rc)), &styles)
+		title = SkinTitle(fmt.Sprintf(TitleFmt, resource, countStr), &styles)
 	} else {
-		title = SkinTitle(fmt.Sprintf(NSTitleFmt, resource, ns, render.AsThousands(rc)), &styles)
+		title = SkinTitle(fmt.Sprintf(NSTitleFmt, resource, ns, countStr), &styles)
 	}
 
 	buff := t.cmdBuff.GetText()

@@ -35,6 +35,7 @@ type Factory struct {
 	forwarders     Forwarders
 	firstPageCache map[string][]runtime.Object  // Track first page data for fast loading
 	fastLoadDone   map[string]bool              // Track which GVRs have been fast-loaded
+	backgroundLoading map[string]bool            // Track which GVRs are still loading in background
 	mx             sync.RWMutex
 }
 
@@ -46,6 +47,7 @@ func NewFactory(clt client.Connection) *Factory {
 		forwarders:     NewForwarders(),
 		firstPageCache: make(map[string][]runtime.Object),
 		fastLoadDone:   make(map[string]bool),
+		backgroundLoading: make(map[string]bool),
 	}
 }
 
@@ -96,6 +98,7 @@ func (f *Factory) List(gvr *client.GVR, ns string, wait bool, lbls labels.Select
 			f.mx.Lock()
 			f.firstPageCache[gvrKey] = fastData
 			f.fastLoadDone[gvrKey] = true
+			f.backgroundLoading[gvrKey] = true  // Mark as loading in background
 			f.mx.Unlock()
 			
 			slog.Debug("[PERF] Fast first page loaded", "gvr", gvr, "ns", ns, "count", len(fastData))
@@ -342,6 +345,14 @@ func (f *Factory) ForwarderFor(path string) (Forwarder, bool) {
 	return fwd, ok
 }
 
+// IsBackgroundLoading checks if a GVR is still loading data in the background.
+func (f *Factory) IsBackgroundLoading(gvr *client.GVR, ns string) bool {
+	gvrKey := gvr.String() + ":" + ns
+	f.mx.RLock()
+	defer f.mx.RUnlock()
+	return f.backgroundLoading[gvrKey]
+}
+
 // ValidatePortForwards check if pods are still around for portforwards.
 // BOZO!! Review!!!
 func (f *Factory) ValidatePortForwards() {
@@ -473,6 +484,7 @@ func (f *Factory) startBackgroundInformer(gvr *client.GVR, ns string) {
 		gvrKey := gvr.String() + ":" + ns
 		f.mx.Lock()
 		delete(f.firstPageCache, gvrKey)
+		f.backgroundLoading[gvrKey] = false  // Mark as no longer loading
 		f.mx.Unlock()
 		
 		duration := time.Since(start)
