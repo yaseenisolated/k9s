@@ -1,0 +1,55 @@
+plugins:
+  # NodeClaim to Node navigation plugin - the actual use case from the analysis
+  nodeclaim-to-node:
+    shortCut: Ctrl-N
+    confirm: false
+    description: Jump to Node from NodeClaim
+    scopes:
+      - nodeclaims
+    command: sh
+    background: true  # Required for navigation functionality
+    args:
+      - -c
+      - |
+        NODE_NAME=$(kubectl get nodeclaim $NAME -o jsonpath='{.status.nodeName}' 2>/dev/null)
+        if [ -n "$NODE_NAME" ]; then
+          echo "Found associated node: $NODE_NAME"
+          echo "NAVIGATE:nodes $NODE_NAME"
+        else
+          echo "No associated node found for NodeClaim: $NAME"
+        fi
+
+  # Alternative version for pods that navigates to nodes (for testing)
+  pod-to-node:
+    shortCut: Ctrl-P
+    confirm: false
+    description: Jump to Node from Pod
+    scopes:
+      - pods
+    command: sh
+    background: true
+    args:
+      - -c
+      - |
+        NODE_NAME=$(kubectl get pod $NAME -n $NAMESPACE -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+        if [ -n "$NODE_NAME" ]; then
+          echo "Pod $NAME runs on node: $NODE_NAME"
+          echo "NAVIGATE:nodes $NODE_NAME"
+        else
+          echo "No node assignment found for pod: $NAME"
+        fi
+        
+  # Service to Endpoints navigation
+  service-to-endpoints:
+    shortCut: Ctrl-E
+    confirm: false
+    description: Jump to Endpoints from Service  
+    scopes:
+      - services
+    command: sh
+    background: true
+    args:
+      - -c
+      - |
+        echo "Navigating from service $NAME to endpoints..."
+        echo "NAVIGATE:endpoints $NAME"

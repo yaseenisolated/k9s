@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/derailed/k9s/internal/config"
+	"github.com/derailed/k9s/internal/model"
 	"github.com/derailed/k9s/internal/slogs"
 	"github.com/derailed/k9s/internal/ui"
 	"github.com/derailed/k9s/internal/ui/dialog"
@@ -222,11 +223,54 @@ func pluginAction(r Runner, p *config.Plugin) ui.ActionHandler {
 			}
 			go func() {
 				for st := range statusChan {
+					// Check for navigation commands in plugin output
+					if strings.Contains(st, outputPrefix) {
+						line := strings.TrimPrefix(st, outputPrefix)
+						line = strings.TrimSpace(line)
+
+						// Parse navigation command: NAVIGATE:resource [filter]
+						if strings.HasPrefix(line, "NAVIGATE:") {
+							navCmd := strings.TrimPrefix(line, "NAVIGATE:")
+							parts := strings.Fields(navCmd)
+							if len(parts) >= 1 {
+								resource := parts[0]
+								// Execute navigation on main UI thread
+								r.App().QueueUpdateDraw(func() {
+									r.App().gotoResource(resource, "", false, true)
+									
+									// Apply filter if provided
+									if len(parts) > 1 {
+										filter := parts[1]
+										// Give the new view time to initialize, then apply filter
+										r.App().QueueUpdateDraw(func() {
+											if top := r.App().Content.Top(); top != nil {
+												if filterer, ok := top.(model.Filterer); ok {
+													filterer.SetFilter(filter)
+													r.App().Flash().Infof("Navigated to %s, filtered by: %s", resource, filter)
+												} else {
+													r.App().Flash().Infof("Navigated to %s (filtering not supported)", resource)
+												}
+											} else {
+												r.App().Flash().Infof("Navigated to %s", resource)
+											}
+										})
+									} else {
+										r.App().Flash().Infof("Navigated to %s", resource)
+									}
+								})
+								continue
+							}
+						}
+					}
+
 					if !p.OverwriteOutput {
 						r.App().Flash().Infof("Plugin command launched successfully: %q", st)
 					} else if strings.Contains(st, outputPrefix) {
 						infoMsg := strings.TrimPrefix(st, outputPrefix)
-						r.App().Flash().Info(strings.TrimSpace(infoMsg))
+						// Skip navigation commands from display output
+						if !strings.HasPrefix(strings.TrimSpace(infoMsg), "NAVIGATE:") {
+							r.App().Flash().Info(strings.TrimSpace(infoMsg))
+						}
 						return
 					}
 				}
